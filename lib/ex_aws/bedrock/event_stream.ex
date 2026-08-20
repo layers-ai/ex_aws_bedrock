@@ -399,48 +399,45 @@ defmodule ExAws.Bedrock.EventStream do
     # First remove the "p" field which is internal metadata
     payload = Map.drop(payload, ["p"])
 
-    # Map the AWS event format to the expected output structure
-    processed_payload =
-      case payload do
-        # Message start event
-        %{"role" => "assistant"} ->
-          %{"messageStart" => %{"role" => "assistant"}}
-
-        # Content block delta with text
-        %{"contentBlockIndex" => index, "delta" => %{"text" => text}} ->
-          %{"contentBlockDelta" => %{"delta" => %{"text" => text}, "contentBlockIndex" => index}}
-
-        # Content block delta with tool use
-        %{"contentBlockIndex" => index, "delta" => %{"toolUse" => tool_use}} ->
-          %{
-            "contentBlockDelta" => %{
-              "delta" => %{"toolUse" => tool_use},
-              "contentBlockIndex" => index
-            }
-          }
-
-        # Content block start
-        %{"contentBlockIndex" => index, "start" => start} ->
-          %{"contentBlockStart" => %{"start" => start, "contentBlockIndex" => index}}
-
-        # Content block stop
-        %{"contentBlockIndex" => index}
-        when not is_map_key(payload, "delta") and not is_map_key(payload, "start") ->
-          %{"contentBlockStop" => %{"contentBlockIndex" => index}}
-
-        # Message stop
-        %{"stopReason" => reason} ->
-          %{"messageStop" => %{"stopReason" => reason}}
-
-        # Metadata
-        %{"usage" => usage, "metrics" => metrics} ->
-          %{"metadata" => %{"usage" => usage, "metrics" => metrics}}
-
-        # Other events pass through unchanged
-        _ ->
-          payload
-      end
-
-    {:ok, processed_payload}
+    {:ok, map_converse_event(payload)}
   end
+
+  # Maps the AWS converse event format to the expected output structure.
+
+  # Message start event
+  defp map_converse_event(%{"role" => "assistant"}),
+    do: %{"messageStart" => %{"role" => "assistant"}}
+
+  # Content block delta with text
+  defp map_converse_event(%{"contentBlockIndex" => index, "delta" => %{"text" => text}}),
+    do: %{"contentBlockDelta" => %{"delta" => %{"text" => text}, "contentBlockIndex" => index}}
+
+  # Content block delta with tool use
+  defp map_converse_event(%{"contentBlockIndex" => index, "delta" => %{"toolUse" => tool_use}}),
+    do: %{
+      "contentBlockDelta" => %{
+        "delta" => %{"toolUse" => tool_use},
+        "contentBlockIndex" => index
+      }
+    }
+
+  # Content block start
+  defp map_converse_event(%{"contentBlockIndex" => index, "start" => start}),
+    do: %{"contentBlockStart" => %{"start" => start, "contentBlockIndex" => index}}
+
+  # Content block stop
+  defp map_converse_event(%{"contentBlockIndex" => index} = payload)
+       when not is_map_key(payload, "delta") and not is_map_key(payload, "start"),
+       do: %{"contentBlockStop" => %{"contentBlockIndex" => index}}
+
+  # Message stop
+  defp map_converse_event(%{"stopReason" => reason}),
+    do: %{"messageStop" => %{"stopReason" => reason}}
+
+  # Metadata
+  defp map_converse_event(%{"usage" => usage, "metrics" => metrics}),
+    do: %{"metadata" => %{"usage" => usage, "metrics" => metrics}}
+
+  # Other events pass through unchanged
+  defp map_converse_event(payload), do: payload
 end
