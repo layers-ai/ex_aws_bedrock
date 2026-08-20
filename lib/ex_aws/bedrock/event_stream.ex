@@ -19,7 +19,13 @@ defmodule ExAws.Bedrock.EventStream do
 
   if {:module, :hackney} == Code.ensure_loaded(:hackney) &&
        Kernel.function_exported?(:hackney, :post, 4) do
-    @http_ua :hackney_request.default_ua()
+    # hackney >= 4 moved default_ua/0 from :hackney_request to :hackney
+    if function_exported?(:hackney, :default_ua, 0) do
+      @http_ua :hackney.default_ua()
+    else
+      @http_ua :hackney_request.default_ua()
+    end
+
     @library_version Application.spec(:ex_aws_bedrock)[:vsn]
     @user_agent "#{@http_ua} ex_aws/bedrock/#{@library_version}"
     @headers [
@@ -28,7 +34,11 @@ defmodule ExAws.Bedrock.EventStream do
       {"user-agent", @user_agent},
       {"x-amzn-bedrock-accept", "*/*"}
     ]
-    @hackney_options [{:async, :once}]
+    # :protocols forces HTTP/1.1: hackney >= 4 negotiates HTTP/2 via ALPN by
+    # default, but its h2 path does not deliver async body messages, so the
+    # event stream would hang waiting for chunks that never arrive. HTTP/1.1
+    # also guarantees the chunked transfer-encoding this module verifies.
+    @hackney_options [{:async, :once}, {:protocols, [:http1]}]
 
     @doc """
     Stream of chunks from the response stream.
@@ -38,7 +48,7 @@ defmodule ExAws.Bedrock.EventStream do
 
     [AWS API Docs](https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_ResponseStream.html)
     """
-    def stream_objects!(%{service: service, data: data} = post_operation, opts, config) do
+    def stream_objects!(%{service: service, data: data} = post_operation, _opts, config) do
       encoded_data = Jason.encode!(data)
       url = build_request_url(post_operation, config)
       config = Map.put(config, :service_override, :bedrock)
@@ -53,12 +63,11 @@ defmodule ExAws.Bedrock.EventStream do
           encoded_data
         )
 
-      # Extract HTTP options and build hackney options with timeout configurations
-      hackney_options = build_hackney_options(config, opts)
+      hackney_opts = hackney_options(config)
 
       stream =
         Stream.resource(
-          fn -> open_stream(url, full_headers, encoded_data, hackney_options) end,
+          fn -> open_stream(url, full_headers, encoded_data, hackney_opts) end,
           &next_event/1,
           &close_acc/1
         )
@@ -66,8 +75,27 @@ defmodule ExAws.Bedrock.EventStream do
       Stream.flat_map(stream, &decode_chunk/1)
     end
 
-    defp open_stream(url, headers, body, hackney_options) do
-      {:ok, ref} = :hackney.post(url, headers, body, hackney_options)
+    @doc """
+    Builds the hackney options for the streaming request.
+
+    Merges caller-provided options from the ExAws config `:http_opts` (e.g.
+    `recv_timeout`, `connect_timeout`, `pool`) on top of the async-streaming
+    defaults. Without this, the stream would always use hackney's built-in
+    `recv_timeout` (5s) and drop slow responses regardless of the timeout the
+    caller configured.
+
+    The streaming defaults win on conflicting keys, so the async-streaming mode
+    (`async: :once`) and the forced HTTP/1.1 protocol can't be accidentally
+    disabled by caller options.
+    """
+    def hackney_options(config) do
+      config
+      |> Map.get(:http_opts, [])
+      |> Keyword.merge(@hackney_options)
+    end
+
+    defp open_stream(url, headers, body, hackney_opts) do
+      {:ok, ref} = :hackney.post(url, headers, body, hackney_opts)
       await_status(ref)
     end
 
@@ -81,6 +109,9 @@ defmodule ExAws.Bedrock.EventStream do
 
         {:hackney_response, ^ref, {:error, {:closed, :timeout}}} ->
           :closed
+
+        {:hackney_response, ^ref, {:error, reason}} ->
+          raise ExAws.Error, "Bedrock stream request failed: #{inspect(reason)}"
       end
     end
 
@@ -88,7 +119,9 @@ defmodule ExAws.Bedrock.EventStream do
 
     defp next_event({:error_status, ref, status}), do: read_error_response(ref, status)
 
-    defp next_event(ref) when is_reference(ref) do
+    # hackney < 4 identifies async responses by reference,
+    # hackney >= 4 by the connection pid.
+    defp next_event(ref) when is_reference(ref) or is_pid(ref) do
       :ok = :hackney.stream_next(ref)
       await_event(ref)
     end
@@ -103,8 +136,15 @@ defmodule ExAws.Bedrock.EventStream do
         {:hackney_response, ^ref, :done} ->
           {:halt, :done}
 
-        {:hackney_response, ^ref, data} ->
+        {:hackney_response, ^ref, {:error, reason}} ->
+          raise ExAws.Error, "Bedrock stream failed mid-stream: #{inspect(reason)}"
+
+        {:hackney_response, ^ref, data} when is_binary(data) ->
           {[data], ref}
+
+        {:hackney_response, ^ref, other} ->
+          raise ExAws.Error,
+                "Bedrock stream received unexpected message: #{inspect(other)}"
       end
     end
 
@@ -147,7 +187,7 @@ defmodule ExAws.Bedrock.EventStream do
 
     defp drained_body(chunks), do: chunks |> Enum.reverse() |> IO.iodata_to_binary()
 
-    defp close_acc(ref) when is_reference(ref), do: safe_close(ref)
+    defp close_acc(ref) when is_reference(ref) or is_pid(ref), do: safe_close(ref)
     defp close_acc({:error_status, ref, _status}), do: safe_close(ref)
     defp close_acc(_finished), do: :ok
 
@@ -278,7 +318,7 @@ defmodule ExAws.Bedrock.EventStream do
 
     if byte_size(rest) >= body_length + @checksum_size do
       <<
-        body::binary-size(body_length),
+        body::binary-size(^body_length),
         message_checksum::unsigned-32,
         next_data::binary
       >> = rest
@@ -335,6 +375,9 @@ defmodule ExAws.Bedrock.EventStream do
         with {:ok, json} <- Base.decode64(bytes),
              {:ok, payload} <- Jason.decode(json) do
           {:ok, payload}
+        else
+          {:error, error} -> {:error, error}
+          error -> {:error, error}
         end
 
       # Process converse_stream events - simple direct transformation
@@ -399,44 +442,5 @@ defmodule ExAws.Bedrock.EventStream do
       end
 
     {:ok, processed_payload}
-  end
-
-  # Build hackney options by merging base options with HTTP timeout configurations
-  defp build_hackney_options(config, opts) do
-    # Start with base options
-    base_options = @hackney_options
-
-    # Extract HTTP options from ExAws config
-    http_opts = get_http_opts(config, opts)
-
-    # Extract timeout-related options and convert to hackney format
-    timeout_options = extract_timeout_options(http_opts)
-
-    # Merge all options, with timeout_options taking precedence
-    base_options ++ timeout_options
-  end
-
-  # Get HTTP options from config and opts, with opts taking precedence
-  defp get_http_opts(config, opts) do
-    config_http_opts = Map.get(config, :http_opts, [])
-
-    opts_http_opts =
-      case opts do
-        nil -> []
-        opts when is_list(opts) -> Keyword.get(opts, :http_opts, [])
-        _ -> []
-      end
-
-    # Merge config options with opts, opts taking precedence
-    Keyword.merge(config_http_opts, opts_http_opts)
-  end
-
-  # Extract timeout options that hackney understands
-  defp extract_timeout_options(http_opts) do
-    timeout_keys = [:connect_timeout, :recv_timeout, :timeout]
-
-    timeout_keys
-    |> Enum.filter(fn key -> Keyword.has_key?(http_opts, key) end)
-    |> Enum.map(fn key -> {key, Keyword.get(http_opts, key)} end)
   end
 end

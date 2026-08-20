@@ -18,6 +18,49 @@ defmodule ExAws.Bedrock.EventStreamTest do
       assert [{:chunk, %{"type" => _}}, {:chunk, %{"type" => _}}] =
                EventStream.decode_chunk(multipart_chunk)
     end
+
+    test "should handle invalid prelude checksum", %{chunk_with_invalid_prelude_checksum: chunk} do
+      assert [{:bad_chunk, ^chunk, :invalid_prelude_checksum}] =
+               EventStream.decode_chunk(chunk)
+    end
+
+    test "should handle invalid message checksum", %{chunk_with_invalid_message_checksum: chunk} do
+      assert [{:bad_chunk, ^chunk, :invalid_message_checksum}] =
+               EventStream.decode_chunk(chunk)
+    end
+
+    test "should handle incomplete chunk", %{incomplete_chunk: chunk} do
+      assert [{:bad_chunk, ^chunk, :invalid_chunk}] = EventStream.decode_chunk(chunk)
+    end
+  end
+
+  describe "hackney_options/1" do
+    test "defaults to async streaming over HTTP/1.1 when no http_opts are given" do
+      assert EventStream.hackney_options(%{}) == [async: :once, protocols: [:http1]]
+    end
+
+    test "honors caller recv_timeout / connect_timeout / pool from :http_opts" do
+      opts =
+        EventStream.hackney_options(%{
+          http_opts: [recv_timeout: 600_000, connect_timeout: 10_000, pool: :ex_aws]
+        })
+
+      assert Keyword.get(opts, :async) == :once
+      assert Keyword.get(opts, :recv_timeout) == 600_000
+      assert Keyword.get(opts, :connect_timeout) == 10_000
+      assert Keyword.get(opts, :pool) == :ex_aws
+    end
+
+    test "streaming defaults win so async: :once and HTTP/1.1 cannot be disabled" do
+      opts =
+        EventStream.hackney_options(%{
+          http_opts: [async: false, protocols: [:http2], recv_timeout: 1_000]
+        })
+
+      assert Keyword.get(opts, :async) == :once
+      assert Keyword.get(opts, :protocols) == [:http1]
+      assert Keyword.get(opts, :recv_timeout) == 1_000
+    end
   end
 
   test "should handle invalid prelude checksum", %{chunk_with_invalid_prelude_checksum: chunk} do
@@ -148,7 +191,7 @@ defmodule ExAws.Bedrock.EventStreamTest do
     message_length = message_total_length - @message_overhead
     body_length = message_length - headers_length
 
-    <<headers::binary-size(headers_length), body::binary-size(body_length),
+    <<headers::binary-size(^headers_length), body::binary-size(^body_length),
       _message_checksum::unsigned-32>> = rest
 
     invalid_message_checksum = 0
